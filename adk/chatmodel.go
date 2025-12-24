@@ -647,13 +647,15 @@ func (a *ChatModelAgent) buildRunFunc(ctx context.Context) runFunc {
 		if len(toolsNodeConf.Tools) == 0 {
 			a.run = func(ctx context.Context, input *AgentInput, generator *AsyncGenerator[*AgentEvent],
 				store *bridgeStore, opts ...compose.Option) {
+
+				state := &ChatModelAgentState{}
 				r, err := compose.NewChain[*AgentInput, Message]().
 					AppendLambda(compose.InvokableLambda(func(ctx context.Context, input *AgentInput) ([]Message, error) {
 						messages, err := a.genModelInput(ctx, instruction, input)
 						if err != nil {
 							return nil, err
 						}
-						state := &ChatModelAgentState{Messages: messages}
+						state.Messages = messages
 						for _, b := range a.beforeChatModels {
 							err = b(ctx, state)
 							if err != nil {
@@ -663,6 +665,58 @@ func (a *ChatModelAgent) buildRunFunc(ctx context.Context) runFunc {
 						return state.Messages, nil
 					})).
 					AppendChatModel(a.model).
+					AppendLambda(compose.CollectableLambda(func(ctx context.Context, result *schema.StreamReader[Message]) (output Message, err error) {
+						var msg, msg2 Message
+						var msgStream MessageStream
+						var event *AgentEvent
+						if input.EnableStreaming {
+							ss := result.Copy(2)
+							msgStream = ss[0]
+							msg2, err = schema.ConcatMessageStream(ss[1])
+							if err != nil {
+								return nil, err
+							}
+						} else {
+							msg, err = schema.ConcatMessageStream(result)
+							if err != nil {
+								return nil, err
+							}
+							msg2 = msg
+						}
+
+						if a.outputKey != "" {
+							if msgStream != nil {
+								// copy the stream first because when setting output to session, the stream will be consumed
+								ss := msgStream.Copy(3)
+								event = EventFromMessage(msg, ss[1], schema.Assistant, "")
+								msgStream = ss[0]
+							} else {
+								event = EventFromMessage(msg, nil, schema.Assistant, "")
+							}
+							// send event asap, because setting output to session will block until stream fully consumed
+							generator.Send(event)
+							err = setOutputToSession(ctx, msg, msgStream, a.outputKey)
+							if err != nil {
+								generator.Send(&AgentEvent{Err: err})
+							}
+						} else {
+							event = EventFromMessage(msg, msgStream, schema.Assistant, "")
+							generator.Send(event)
+						}
+
+						state.Messages = append(state.Messages, msg2)
+						for _, ac := range a.afterChatModels {
+							err = ac(ctx, state)
+							if err != nil {
+								return nil, err
+							}
+						}
+
+						if len(state.Messages) > 0 {
+							return state.Messages[len(state.Messages)-1], nil
+						}
+						return nil, nil
+					})).
 					Compile(ctx, compose.WithGraphName(a.name),
 						compose.WithCheckPointStore(store),
 						compose.WithSerializer(&gobSerializer{}))
@@ -671,40 +725,14 @@ func (a *ChatModelAgent) buildRunFunc(ctx context.Context) runFunc {
 					return
 				}
 
-				var msg Message
-				var msgStream MessageStream
 				if input.EnableStreaming {
-					msgStream, err = r.Stream(ctx, input, opts...)
+					_, err = r.Stream(ctx, input, opts...)
 				} else {
-					msg, err = r.Invoke(ctx, input, opts...)
+					_, err = r.Invoke(ctx, input, opts...)
 				}
-
-				var event *AgentEvent
-				if err == nil {
-					if a.outputKey != "" {
-						if msgStream != nil {
-							// copy the stream first because when setting output to session, the stream will be consumed
-							ss := msgStream.Copy(2)
-							event = EventFromMessage(msg, ss[1], schema.Assistant, "")
-							msgStream = ss[0]
-						} else {
-							event = EventFromMessage(msg, nil, schema.Assistant, "")
-						}
-						// send event asap, because setting output to session will block until stream fully consumed
-						generator.Send(event)
-						err = setOutputToSession(ctx, msg, msgStream, a.outputKey)
-						if err != nil {
-							generator.Send(&AgentEvent{Err: err})
-						}
-					} else {
-						event = EventFromMessage(msg, msgStream, schema.Assistant, "")
-						generator.Send(event)
-					}
-				} else {
-					event = &AgentEvent{Err: err}
-					generator.Send(event)
+				if err != nil {
+					generator.Send(&AgentEvent{Err: err})
 				}
-
 				generator.Close()
 			}
 
